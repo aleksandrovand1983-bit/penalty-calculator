@@ -574,24 +574,51 @@ with tab2:
     )
 
     if sched_mode == "📅 Квартальный (по годам)":
-        st.caption("Платежи разбиты по кварталам: 31 марта, 30 июня, 30 сентября, 31 декабря. "
-                   "Для нестандартных квартальных графиков (разные суммы или даты) — используйте «Excel простой» или «PDF».")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            q_year_start = st.number_input("Год начала", min_value=2000, max_value=2050,
-                                           value=2012, step=1)
-        with c2:
-            q_year_end = st.number_input("Год окончания", min_value=2000, max_value=2050,
-                                         value=2021, step=1)
-        with c3:
-            q_amount = st.number_input("Сумма за квартал (руб.)", min_value=0.0,
-                                       value=5721.03, step=0.01, format="%.2f")
+        q_input = st.radio(
+            "Источник:",
+            ["✏️ Ввести параметры вручную", "📂 Загрузить Excel (Дата | Сумма)"],
+            horizontal=True,
+            key="q_input",
+        )
 
-        # Концы кварталов
-        quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
-        for yr in range(int(q_year_start), int(q_year_end) + 1):
-            for mon, day in quarter_ends:
-                schedule_data.append((date(yr, mon, day), float(q_amount)))
+        if q_input == "✏️ Ввести параметры вручную":
+            st.caption("Фиксированная сумма каждый квартал: 31 марта, 30 июня, 30 сентября, 31 декабря.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                q_year_start = st.number_input("Год начала", min_value=2000, max_value=2050,
+                                               value=2012, step=1)
+            with c2:
+                q_year_end = st.number_input("Год окончания", min_value=2000, max_value=2050,
+                                             value=2021, step=1)
+            with c3:
+                q_amount = st.number_input("Сумма за квартал (руб.)", min_value=0.0,
+                                           value=5721.03, step=0.01, format="%.2f")
+
+            quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
+            for yr in range(int(q_year_start), int(q_year_end) + 1):
+                for mon, day in quarter_ends:
+                    schedule_data.append((date(yr, mon, day), float(q_amount)))
+
+        else:
+            st.caption("Формат файла: первая колонка — дата платежа, вторая — сумма. "
+                       "Подходит для квартальных графиков с разными суммами.")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                q_file = st.file_uploader("Excel-файл квартального графика",
+                                          type=["xlsx", "xls"], key="sched_q_excel")
+            with c2:
+                st.download_button(
+                    "📥 Шаблон",
+                    data=make_schedule_template(),
+                    file_name="шаблон_квартальный.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            if q_file:
+                try:
+                    schedule_data = parse_simple_excel(q_file)
+                except Exception as e:
+                    st.error(f"Ошибка чтения: {e}")
 
         if schedule_data:
             df_s = pd.DataFrame(schedule_data, columns=["Дата", "Сумма (руб.)"])
