@@ -300,6 +300,71 @@ def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
     return result
 
 
+def parse_pdf_schedule(file) -> list[tuple[date, float]]:
+    """
+    Извлекает график платежей из PDF с таблицей.
+    Ищет колонки «месяц/дата» и «основной платеж/сумма».
+    """
+    import pdfplumber
+
+    all_rows: list[list] = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                if table:
+                    all_rows.extend(table)
+
+    if not all_rows:
+        return []
+
+    date_col_idx: Optional[int] = None
+    amount_col_idx: Optional[int] = None
+    header_row_idx: Optional[int] = None
+    skip_words = ["итого", "всего", "total", "полная"]
+
+    for i, row in enumerate(all_rows):
+        if not row:
+            continue
+        vals = [str(v).strip().lower() if v else "" for v in row]
+        row_text = " ".join(vals)
+        if ("месяц" in row_text or "дата" in row_text) and ("платеж" in row_text or "сумма" in row_text):
+            header_row_idx = i
+            for j, v in enumerate(vals):
+                if ("месяц" in v or "дата" in v) and date_col_idx is None:
+                    date_col_idx = j
+                if "основной" in v and amount_col_idx is None:
+                    amount_col_idx = j
+            if amount_col_idx is None:
+                for j, v in enumerate(vals):
+                    if ("платеж" in v or "сумма" in v) and j != date_col_idx and amount_col_idx is None:
+                        amount_col_idx = j
+            break
+
+    if date_col_idx is None:
+        date_col_idx = 0
+    if amount_col_idx is None:
+        amount_col_idx = 1
+
+    result: list[tuple[date, float]] = []
+    for i, row in enumerate(all_rows):
+        if header_row_idx is not None and i <= header_row_idx:
+            continue
+        if not row or len(row) <= max(date_col_idx, amount_col_idx):
+            continue
+        date_val = row[date_col_idx]
+        if date_val and any(kw in str(date_val).lower() for kw in skip_words):
+            continue
+        d = _parse_date(date_val)
+        if d is None:
+            continue
+        a = _parse_amount(row[amount_col_idx])
+        if a:
+            result.append((d, a))
+
+    return result
+
+
 def parse_1c_excel(file) -> list[tuple[date, float]]:
     """
     Формат 1С «Анализ субконто».
@@ -502,13 +567,15 @@ with tab2:
         "Способ ввода:",
         ["📅 Квартальный (по годам)",
          "📂 Excel ежемесячный (месяц | основной платеж)",
-         "📂 Excel простой (Дата | Сумма)"],
+         "📂 Excel простой (Дата | Сумма)",
+         "📄 PDF (таблица с датами и суммами)"],
         horizontal=True,
         key="sched_mode",
     )
 
     if sched_mode == "📅 Квартальный (по годам)":
-        st.caption("Платежи разбиты по кварталам: 31 марта, 30 июня, 30 сентября, 31 декабря.")
+        st.caption("Платежи разбиты по кварталам: 31 марта, 30 июня, 30 сентября, 31 декабря. "
+                   "Для нестандартных квартальных графиков (разные суммы или даты) — используйте «Excel простой» или «PDF».")
         c1, c2, c3 = st.columns(3)
         with c1:
             q_year_start = st.number_input("Год начала", min_value=2000, max_value=2050,
@@ -559,7 +626,7 @@ with tab2:
         else:
             st.info("Загрузите Excel-файл ежемесячного графика (например, выгруженный из расчёта займа).")
 
-    else:
+    elif sched_mode == "📂 Excel простой (Дата | Сумма)":
         c1, c2 = st.columns([3, 1])
         with c1:
             schedule_file = st.file_uploader(
@@ -590,6 +657,36 @@ with tab2:
                 st.error(f"Ошибка чтения: {e}")
         else:
             st.info("Формат файла: первая колонка — дата, вторая — сумма. Скачайте шаблон →")
+
+    else:
+        st.caption("Подходит для PDF-графиков из банков и расчётных систем. "
+                   "Программа автоматически найдёт таблицу с датами и суммами.")
+        schedule_file = st.file_uploader(
+            "PDF-файл графика", type=["pdf"], key="sched_pdf"
+        )
+        if schedule_file:
+            try:
+                schedule_data = parse_pdf_schedule(schedule_file)
+                if schedule_data:
+                    df_s = pd.DataFrame(schedule_data, columns=["Дата", "Сумма (руб.)"])
+                    df_s["Дата"] = df_s["Дата"].apply(lambda d: d.strftime("%d.%m.%Y"))
+                    df_s["Сумма (руб.)"] = df_s["Сумма (руб.)"].apply(lambda x: f"{x:,.2f}")
+                    st.success(f"✅ {len(schedule_data)} платежей | "
+                               f"Итого: {sum(a for _, a in schedule_data):,.2f} ₽")
+                    st.dataframe(df_s, use_container_width=True, hide_index=True)
+                else:
+                    raw_diag: list[list] = []
+                    import pdfplumber
+                    with pdfplumber.open(schedule_file) as pdf:
+                        for page in pdf.pages:
+                            for tbl in page.extract_tables():
+                                raw_diag.extend(tbl)
+                    st.warning("Таблица не распознана. Первые строки из PDF:")
+                    st.dataframe(pd.DataFrame(raw_diag[:10]), use_container_width=True)
+            except Exception as e:
+                st.error(f"Ошибка чтения PDF: {e}")
+        else:
+            st.info("Загрузите PDF-файл графика платежей. Программа сама найдёт столбцы с датами и суммами.")
 
 # ── ТАБ 3: ОПЛАТЫ ─────────────────────────────────────────────────────────────
 with tab3:
