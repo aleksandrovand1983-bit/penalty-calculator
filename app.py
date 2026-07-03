@@ -368,7 +368,8 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
 def parse_1c_excel(file) -> list[tuple[date, float]]:
     """
     Формат 1С «Анализ субконто».
-    Ищет строки «Обороты за ДД.ММ.ГГ» и берёт значение из колонки Кредит (Обороты).
+    Ищет строки «Обороты за ДД.ММ.ГГ» в любом столбце,
+    берёт значение из колонки Кредит (Обороты) или первое ненулевое число.
     """
     raw = pd.read_excel(file, header=None)
 
@@ -382,14 +383,21 @@ def parse_1c_excel(file) -> list[tuple[date, float]]:
             break
 
     payments: list[tuple[date, float]] = []
-    date_re = re.compile(r"Обороты за\s+(\d{2}\.\d{2}\.\d{2,4})")
+    date_re = re.compile(r"Обороты за\s+(\d{2}\.\d{2}\.\d{2,4})", re.IGNORECASE)
 
     for _, row in raw.iterrows():
-        cell = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-        m = date_re.search(cell)
-        if not m:
+        # Ищем «Обороты за» в ЛЮБОЙ ячейке строки (1С может вкладывать иерархически)
+        ds: Optional[str] = None
+        for cell_val in row:
+            if pd.isna(cell_val):
+                continue
+            m = date_re.search(str(cell_val))
+            if m:
+                ds = m.group(1)
+                break
+        if ds is None:
             continue
-        ds = m.group(1)
+
         try:
             fmt = "%d.%m.%y" if len(ds) == 8 else "%d.%m.%Y"
             d = datetime.strptime(ds, fmt).date()
@@ -401,14 +409,12 @@ def parse_1c_excel(file) -> list[tuple[date, float]]:
             amount = _parse_amount(row.iloc[kredit_oborot_col])
 
         if amount is None:
-            # Эвристика: платёж — наименьшее значение значительно меньше остатка
-            nums = [_parse_amount(v) for v in row.iloc[1:]]
-            nums = [v for v in nums if v is not None]
-            if nums:
-                max_v = max(nums)
-                small = [v for v in nums if v < max_v * 0.6 and v > 100]
-                if small:
-                    amount = min(small)
+            # Резервный вариант: берём первое ненулевое число в строке
+            for v in row:
+                a = _parse_amount(v)
+                if a and a > 0:
+                    amount = a
+                    break
 
         if amount:
             payments.append((d, amount))
@@ -586,18 +592,22 @@ with tab2:
             c1, c2, c3 = st.columns(3)
             with c1:
                 q_year_start = st.number_input("Год начала", min_value=2000, max_value=2050,
-                                               value=2012, step=1)
+                                               value=None, step=1, placeholder="например, 2020")
             with c2:
                 q_year_end = st.number_input("Год окончания", min_value=2000, max_value=2050,
-                                             value=2021, step=1)
+                                             value=None, step=1, placeholder="например, 2030")
             with c3:
                 q_amount = st.number_input("Сумма за квартал (руб.)", min_value=0.0,
-                                           value=5721.03, step=0.01, format="%.2f")
+                                           value=None, step=0.01, format="%.2f",
+                                           placeholder="например, 5721.03")
 
-            quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
-            for yr in range(int(q_year_start), int(q_year_end) + 1):
-                for mon, day in quarter_ends:
-                    schedule_data.append((date(yr, mon, day), float(q_amount)))
+            if q_year_start and q_year_end and q_amount and q_amount > 0:
+                quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
+                for yr in range(int(q_year_start), int(q_year_end) + 1):
+                    for mon, day in quarter_ends:
+                        schedule_data.append((date(yr, mon, day), float(q_amount)))
+            else:
+                st.info("Заполните все три поля для формирования графика.")
 
         else:
             st.caption("Формат файла: первая колонка — дата платежа, вторая — сумма. "
@@ -735,7 +745,12 @@ with tab3:
             else:
                 payments_data = parse_simple_excel(payments_file)
 
-            if payments_data:
+            if not payments_data and "1С" in fmt:
+                raw_diag = pd.read_excel(payments_file, header=None)
+                st.warning("Оплаты не найдены. Первые строки файла (для диагностики):")
+                st.dataframe(raw_diag.head(12), use_container_width=True)
+                st.info("Если столбцы выглядят правильно — попробуйте «Простой формат (Дата | Сумма)».")
+            elif payments_data:
                 df_p = pd.DataFrame(payments_data, columns=["Дата", "Сумма (руб.)"])
                 df_p["Дата"] = df_p["Дата"].apply(lambda d: d.strftime("%d.%m.%Y"))
                 total_paid = sum(a for _, a in payments_data)
