@@ -425,7 +425,44 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
         if a and a > 0:
             result3.append((d, a))
 
-    return result3
+    if result3:
+        return result3
+
+    # ── Вариант 4: OCR для сканированных PDF ─────────────────────────────────
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract as _tess
+
+        file.seek(0)
+        images = convert_from_bytes(file.read(), dpi=250)
+        ocr_lines: list[str] = []
+        for img in images:
+            txt = _tess.image_to_string(img, lang="rus")
+            ocr_lines.extend(txt.splitlines())
+
+        result4: list[tuple[date, float]] = []
+        for line in ocr_lines:
+            if any(kw in line.lower() for kw in skip_words):
+                continue
+            m = ru_date_re.search(line)
+            if not m:
+                continue
+            try:
+                d = date(int(m.group(3)), _RU_MONTHS[m.group(2).lower()], int(m.group(1)))
+            except (ValueError, KeyError):
+                continue
+            if d.year < 2000:
+                continue
+            amounts = kopek_re.findall(line[m.end():])
+            if not amounts:
+                continue
+            a = _parse_amount(amounts[0])
+            if a and a > 0:
+                result4.append((d, a))
+        return result4
+
+    except Exception:
+        return []
 
 
 def parse_1c_card_excel(file) -> list[tuple[date, float]]:
@@ -816,7 +853,8 @@ with tab2:
         )
         if schedule_file:
             try:
-                schedule_data = parse_pdf_schedule(schedule_file)
+                with st.spinner("Читаю PDF… Если файл сканированный — займёт 15–30 сек (OCR)"):
+                    schedule_data = parse_pdf_schedule(schedule_file)
                 if schedule_data:
                     df_s = pd.DataFrame(schedule_data, columns=["Дата", "Сумма (руб.)"])
                     df_s["Дата"] = df_s["Дата"].apply(lambda d: d.strftime("%d.%m.%Y"))
@@ -825,14 +863,7 @@ with tab2:
                                f"Итого: {sum(a for _, a in schedule_data):,.2f} ₽")
                     st.dataframe(df_s, use_container_width=True, hide_index=True)
                 else:
-                    raw_diag: list[list] = []
-                    import pdfplumber
-                    with pdfplumber.open(schedule_file) as pdf:
-                        for page in pdf.pages:
-                            for tbl in page.extract_tables():
-                                raw_diag.extend(tbl)
-                    st.warning("Таблица не распознана. Первые строки из PDF:")
-                    st.dataframe(pd.DataFrame(raw_diag[:10]), use_container_width=True)
+                    st.warning("Платежи не найдены. PDF может быть защищён или нечитаем.")
             except Exception as e:
                 st.error(f"Ошибка чтения PDF: {e}")
         else:
