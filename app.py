@@ -890,3 +890,66 @@ with tab4:
         df_rates = pd.DataFrame(CBR_RATES, columns=["Дата вступления", "Ставка (%)"])
         df_rates["Дата вступления"] = df_rates["Дата вступления"].apply(
             lambda d: d.strftime("%d.%m.%Y")
+        )
+        edited = st.data_editor(df_rates, use_container_width=True, hide_index=True,
+                                num_rows="dynamic")
+        # Парсим обратно
+        custom_rates: list[tuple[date, float]] = []
+        for _, row in edited.iterrows():
+            try:
+                d = datetime.strptime(str(row["Дата вступления"]), "%d.%m.%Y").date()
+                r = float(row["Ставка (%)"])
+                custom_rates.append((d, r))
+            except Exception:
+                pass
+        cbr_to_use = sorted(custom_rates, key=lambda x: x[0]) if custom_rates else CBR_RATES
+
+    if st.button("🧮 Рассчитать пени", type="primary", use_container_width=True):
+        if not schedule_data:
+            st.error("⚠️ Загрузите график платежей на вкладке «График платежей»")
+        else:
+            results = calculate_penalties(schedule_data, payments_data, cbr_to_use, calc_date)
+
+            if not results:
+                st.success("✅ Просрочек не обнаружено!")
+            else:
+                total_penalty  = sum(r["penalty"] for r in results)
+                total_planned  = sum(a for d, a in schedule_data if d <= calc_date)
+                total_paid_sum = sum(a for d, a in payments_data if d <= calc_date)
+                overdue_debt   = max(0.0, total_planned - total_paid_sum)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("По графику (накоплено)", f"{total_planned:,.2f} ₽")
+                m2.metric("Фактически оплачено",     f"{total_paid_sum:,.2f} ₽")
+                m3.metric("Сумма пеней",              f"{total_penalty:,.2f} ₽",
+                          delta=f"Остаток долга: {overdue_debt:,.2f} ₽",
+                          delta_color="inverse")
+
+                # Таблица расчёта
+                df_res = pd.DataFrame([{
+                    "Период с":           r["date_from"].strftime("%d.%m.%Y"),
+                    "Период по":          r["date_to"].strftime("%d.%m.%Y"),
+                    "Дней":               r["days"],
+                    "Сумма долга, руб.":  f"{r['debt']:,.2f}",
+                    "Ставка ЦБ":          f"{r['rate']:.2f}%",
+                    "1/300 ставки":       f"{r['rate']/300:.4f}%",
+                    "Пени, руб.":         f"{r['penalty']:,.2f}",
+                } for r in results])
+                st.dataframe(df_res, use_container_width=True, hide_index=True)
+                st.markdown(f"**Итого пеней: {total_penalty:,.2f} ₽**")
+
+                # Скачать Excel
+                info = {
+                    "borrower":      borrower or "—",
+                    "contract_num":  contract_num or "—",
+                    "contract_date": contract_date.strftime("%d.%m.%Y"),
+                    "calc_date":     calc_date.strftime("%d.%m.%Y"),
+                }
+                st.download_button(
+                    "📥 Скачать расчёт для суда (Excel)",
+                    data=export_excel(results, info, total_penalty),
+                    file_name=f"пени_{contract_num or 'договор'}_{calc_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True,
+                )
