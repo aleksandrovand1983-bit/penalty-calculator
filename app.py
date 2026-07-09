@@ -243,10 +243,11 @@ def parse_simple_excel(file) -> list[tuple[date, float]]:
     return result
 
 
-def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
+def parse_monthly_schedule_excel(file, use_total: bool = False) -> list[tuple[date, float]]:
     """
     Ежемесячный график с заголовками: месяц | остаток | основной платеж | проценты | всего.
-    Автоматически находит колонку с датой и колонку «основной платеж».
+    use_total=True  → берёт колонку «всего за платеж» (основной + проценты).
+    use_total=False → берёт колонку «основной платеж».
     """
     raw = pd.read_excel(file, header=None)
 
@@ -254,7 +255,7 @@ def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
     amount_col_idx: Optional[int] = None
     header_row_idx: Optional[int] = None
 
-    skip_words = ["итого", "всего", "total", "полная"]
+    skip_words = ["итого", "total", "полная"]
 
     # Найти строку-заголовок по ключевым словам
     for i, row in raw.iterrows():
@@ -265,8 +266,12 @@ def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
             for j, v in enumerate(vals):
                 if ("месяц" in v or "дата" in v) and date_col_idx is None:
                     date_col_idx = j
-                if "основной" in v and amount_col_idx is None:
-                    amount_col_idx = j
+                if use_total:
+                    if ("всего" in v or "итого" in v) and amount_col_idx is None:
+                        amount_col_idx = j
+                else:
+                    if "основной" in v and amount_col_idx is None:
+                        amount_col_idx = j
             break
 
     # Если заголовок не найден — первая строка = заголовок, col0=дата, col1=сумма
@@ -300,10 +305,12 @@ def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
     return result
 
 
-def parse_pdf_schedule(file) -> list[tuple[date, float]]:
+def parse_pdf_schedule(file, use_total: bool = False) -> list[tuple[date, float]]:
     """
     Извлекает график платежей из PDF.
-    Сначала пробует таблицы (pdfplumber), затем — построчный разбор текста.
+    use_total=True  → берёт «всего за платеж» (последнее число с копейками).
+    use_total=False → берёт «основной платеж» (первое число с копейками).
+    Сначала пробует таблицы (pdfplumber), затем OCR.
     """
     import pdfplumber
     import re as _re
@@ -398,7 +405,8 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
         amounts = kopek_re.findall(line[m.end():])
         if not amounts:
             continue
-        a = _parse_amount(amounts[0])
+        chosen = amounts[-1] if use_total else amounts[0]
+        a = _parse_amount(chosen)
         if a and a > 0:
             result2.append((d, a))
 
@@ -421,7 +429,8 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
         amounts = kopek_re3.findall(line[m.end():])
         if not amounts:
             continue
-        a = _parse_amount(amounts[0])
+        chosen = amounts[-1] if use_total else amounts[0]
+        a = _parse_amount(chosen)
         if a and a > 0:
             result3.append((d, a))
 
@@ -456,7 +465,8 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
             amounts = kopek_re.findall(line[m.end():])
             if not amounts:
                 continue
-            a = _parse_amount(amounts[0])
+            chosen = amounts[-1] if use_total else amounts[0]
+            a = _parse_amount(chosen)
             if a and a > 0:
                 result4.append((d, a))
         return result4
@@ -729,6 +739,14 @@ with tab2:
         key="sched_mode",
     )
 
+    penalty_base = st.radio(
+        "Пени начисляются на:",
+        ["Только основной долг", "Основной долг + проценты (всего за платеж)"],
+        horizontal=True,
+        key="penalty_base",
+    )
+    use_total = penalty_base == "Основной долг + проценты (всего за платеж)"
+
     if sched_mode == "📅 Квартальный (по годам)":
         q_input = st.radio(
             "Источник:",
@@ -789,13 +807,14 @@ with tab2:
             st.dataframe(df_s, use_container_width=True, hide_index=True)
 
     elif sched_mode == "📂 Excel ежемесячный (месяц | основной платеж)":
-        st.caption("Формат ежемесячного графика: колонки «месяц», «остаток», «основной платеж», «проценты», «всего».")
+        st.caption("Формат ежемесячного графика: колонки «месяц», «остаток», «основной платеж», «проценты», «всего». "
+                   "Выбор базы пеней выше определяет, какая колонка будет использована.")
         schedule_file = st.file_uploader(
             "Excel-файл графика", type=["xlsx", "xls"], key="sched_monthly"
         )
         if schedule_file:
             try:
-                schedule_data = parse_monthly_schedule_excel(schedule_file)
+                schedule_data = parse_monthly_schedule_excel(schedule_file, use_total=use_total)
                 if schedule_data:
                     df_s = pd.DataFrame(schedule_data, columns=["Дата", "Сумма (руб.)"])
                     df_s["Дата"] = df_s["Дата"].apply(lambda d: d.strftime("%d.%m.%Y"))
@@ -854,7 +873,7 @@ with tab2:
         if schedule_file:
             try:
                 with st.spinner("Читаю PDF… Если файл сканированный — займёт 15–30 сек (OCR)"):
-                    schedule_data = parse_pdf_schedule(schedule_file)
+                    schedule_data = parse_pdf_schedule(schedule_file, use_total=use_total)
                 if schedule_data:
                     df_s = pd.DataFrame(schedule_data, columns=["Дата", "Сумма (руб.)"])
                     df_s["Дата"] = df_s["Дата"].apply(lambda d: d.strftime("%d.%m.%Y"))
