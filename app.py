@@ -365,6 +365,56 @@ def parse_pdf_schedule(file) -> list[tuple[date, float]]:
     return result
 
 
+def parse_1c_card_excel(file) -> list[tuple[date, float]]:
+    """
+    Формат 1С «Карточка счёта».
+    Находит заголовок с «Период» и «Кредит», сдвигает колонку если под-заголовок «Счет»,
+    берёт дату из col 0 и сумму Кредит из найденной колонки.
+    """
+    raw = pd.read_excel(file, header=None)
+
+    kredit_col: Optional[int] = None
+    header_row_idx: Optional[int] = None
+
+    for i, row in raw.iterrows():
+        vals = [str(v).strip() if pd.notna(v) else "" for v in row]
+        if any("Период" in v for v in vals) and any("редит" in v for v in vals):
+            header_row_idx = i
+            for j, v in enumerate(vals):
+                if "редит" in v:
+                    kredit_col = j
+                    break
+            break
+
+    if kredit_col is None:
+        return []
+
+    # Если под-заголовок в kredit_col — «Счет», сумма находится в следующей колонке
+    if header_row_idx is not None and header_row_idx + 1 < len(raw):
+        sub_row = raw.iloc[header_row_idx + 1]
+        if kredit_col < len(sub_row):
+            sub_val = str(sub_row.iloc[kredit_col]).strip() if pd.notna(sub_row.iloc[kredit_col]) else ""
+            if "счет" in sub_val.lower():
+                kredit_col += 1
+
+    payments: list[tuple[date, float]] = []
+
+    for i, row in raw.iterrows():
+        if header_row_idx is not None and i <= header_row_idx + 1:
+            continue
+        # Дата в col 0 — строки «Сальдо», «Обороты» и пустые автоматически пропускаются
+        d = _parse_date(row.iloc[0])
+        if d is None:
+            continue
+        if kredit_col >= len(row):
+            continue
+        amount = _parse_amount(row.iloc[kredit_col])
+        if amount and amount > 0:
+            payments.append((d, amount))
+
+    return payments
+
+
 def parse_1c_excel(file) -> list[tuple[date, float]]:
     """
     Формат 1С «Анализ субконто».
@@ -731,7 +781,7 @@ with tab3:
 
     fmt = st.radio(
         "Формат файла:",
-        ["Анализ субконто (1С)", "Простой формат (Дата | Сумма)"],
+        ["Карточка счёта (1С)", "Анализ субконто (1С)", "Простой формат (Дата | Сумма)"],
         horizontal=True,
     )
     payments_file = st.file_uploader(
@@ -740,12 +790,14 @@ with tab3:
 
     if payments_file:
         try:
-            if "1С" in fmt:
+            if "Карточка" in fmt:
+                payments_data = parse_1c_card_excel(payments_file)
+            elif "субконто" in fmt:
                 payments_data = parse_1c_excel(payments_file)
             else:
                 payments_data = parse_simple_excel(payments_file)
 
-            if not payments_data and "1С" in fmt:
+            if not payments_data and fmt != "Простой формат (Дата | Сумма)":
                 raw_diag = pd.read_excel(payments_file, header=None)
                 st.warning("Оплаты не найдены. Первые строки файла (для диагностики):")
                 st.dataframe(raw_diag.head(12), use_container_width=True)
