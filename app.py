@@ -302,67 +302,130 @@ def parse_monthly_schedule_excel(file) -> list[tuple[date, float]]:
 
 def parse_pdf_schedule(file) -> list[tuple[date, float]]:
     """
-    Извлекает график платежей из PDF с таблицей.
-    Ищет колонки «месяц/дата» и «основной платеж/сумма».
+    Извлекает график платежей из PDF.
+    Сначала пробует таблицы (pdfplumber), затем — построчный разбор текста.
     """
     import pdfplumber
+    import re as _re
 
     all_rows: list[list] = []
+    text_lines: list[str] = []
+
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
                 if table:
                     all_rows.extend(table)
+            txt = page.extract_text()
+            if txt:
+                text_lines.extend(txt.splitlines())
 
-    if not all_rows:
-        return []
-
-    date_col_idx: Optional[int] = None
-    amount_col_idx: Optional[int] = None
-    header_row_idx: Optional[int] = None
     skip_words = ["итого", "всего", "total", "полная"]
 
-    for i, row in enumerate(all_rows):
-        if not row:
-            continue
-        vals = [str(v).strip().lower() if v else "" for v in row]
-        row_text = " ".join(vals)
-        if ("месяц" in row_text or "дата" in row_text) and ("платеж" in row_text or "сумма" in row_text):
-            header_row_idx = i
-            for j, v in enumerate(vals):
-                if ("месяц" in v or "дата" in v) and date_col_idx is None:
-                    date_col_idx = j
-                if "основной" in v and amount_col_idx is None:
-                    amount_col_idx = j
-            if amount_col_idx is None:
+    # ── Вариант 1: таблицы ───────────────────────────────────────────────────
+    if all_rows:
+        date_col_idx: Optional[int] = None
+        amount_col_idx: Optional[int] = None
+        header_row_idx: Optional[int] = None
+
+        for i, row in enumerate(all_rows):
+            if not row:
+                continue
+            vals = [str(v).strip().lower() if v else "" for v in row]
+            row_text = " ".join(vals)
+            if ("месяц" in row_text or "дата" in row_text) and ("платеж" in row_text or "сумма" in row_text):
+                header_row_idx = i
                 for j, v in enumerate(vals):
-                    if ("платеж" in v or "сумма" in v) and j != date_col_idx and amount_col_idx is None:
+                    if ("месяц" in v or "дата" in v) and date_col_idx is None:
+                        date_col_idx = j
+                    if "основной" in v and amount_col_idx is None:
                         amount_col_idx = j
-            break
+                if amount_col_idx is None:
+                    for j, v in enumerate(vals):
+                        if ("платеж" in v or "сумма" in v) and j != date_col_idx and amount_col_idx is None:
+                            amount_col_idx = j
+                break
 
-    if date_col_idx is None:
-        date_col_idx = 0
-    if amount_col_idx is None:
-        amount_col_idx = 1
+        if date_col_idx is None:
+            date_col_idx = 0
+        if amount_col_idx is None:
+            amount_col_idx = 1
 
-    result: list[tuple[date, float]] = []
-    for i, row in enumerate(all_rows):
-        if header_row_idx is not None and i <= header_row_idx:
+        result: list[tuple[date, float]] = []
+        for i, row in enumerate(all_rows):
+            if header_row_idx is not None and i <= header_row_idx:
+                continue
+            if not row or len(row) <= max(date_col_idx, amount_col_idx):
+                continue
+            date_val = row[date_col_idx]
+            if date_val and any(kw in str(date_val).lower() for kw in skip_words):
+                continue
+            d = _parse_date(date_val)
+            if d is None:
+                continue
+            a = _parse_amount(row[amount_col_idx])
+            if a:
+                result.append((d, a))
+
+        if result:
+            return result
+
+    # ── Вариант 2: русские даты + первая сумма с копейками ───────────────────
+    # Формат: «30 июня 2025  598 000  12 458,00  5 026,00  17 484,00»
+    # Баланс («598 000») идёт без копеек → берём первое число вида «12 458,00»
+    ru_date_re = _re.compile(
+        r"(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа"
+        r"|сентября|октября|ноября|декабря)\s+(\d{4})",
+        _re.IGNORECASE,
+    )
+    # «12 458,00» или «12458,00» — группы по 3 цифры через пробел/nbsp
+    kopek_re = _re.compile(r"\d{1,3}(?:[\s\xa0]\d{3})*,\d{2}")
+
+    result2: list[tuple[date, float]] = []
+    for line in text_lines:
+        if any(kw in line.lower() for kw in skip_words):
             continue
-        if not row or len(row) <= max(date_col_idx, amount_col_idx):
+        m = ru_date_re.search(line)
+        if not m:
             continue
-        date_val = row[date_col_idx]
-        if date_val and any(kw in str(date_val).lower() for kw in skip_words):
+        try:
+            d = date(int(m.group(3)), _RU_MONTHS[m.group(2).lower()], int(m.group(1)))
+        except (ValueError, KeyError):
             continue
-        d = _parse_date(date_val)
+        if d.year < 2000:
+            continue
+        amounts = kopek_re.findall(line[m.end():])
+        if not amounts:
+            continue
+        a = _parse_amount(amounts[0])
+        if a and a > 0:
+            result2.append((d, a))
+
+    if result2:
+        return result2
+
+    # ── Вариант 3: числовые даты ДД.ММ.ГГГГ ─────────────────────────────────
+    kopek_re3 = _re.compile(r"\d{1,3}(?:[\s\xa0]\d{3})*,\d{2}")
+    num_date_re = _re.compile(r"\b(\d{2}\.\d{2}\.\d{2,4})\b")
+    result3: list[tuple[date, float]] = []
+    for line in text_lines:
+        if any(kw in line.lower() for kw in skip_words):
+            continue
+        m = num_date_re.search(line)
+        if not m:
+            continue
+        d = _parse_date(m.group(1))
         if d is None:
             continue
-        a = _parse_amount(row[amount_col_idx])
-        if a:
-            result.append((d, a))
+        amounts = kopek_re3.findall(line[m.end():])
+        if not amounts:
+            continue
+        a = _parse_amount(amounts[0])
+        if a and a > 0:
+            result3.append((d, a))
 
-    return result
+    return result3
 
 
 def parse_1c_card_excel(file) -> list[tuple[date, float]]:
@@ -827,66 +890,3 @@ with tab4:
         df_rates = pd.DataFrame(CBR_RATES, columns=["Дата вступления", "Ставка (%)"])
         df_rates["Дата вступления"] = df_rates["Дата вступления"].apply(
             lambda d: d.strftime("%d.%m.%Y")
-        )
-        edited = st.data_editor(df_rates, use_container_width=True, hide_index=True,
-                                num_rows="dynamic")
-        # Парсим обратно
-        custom_rates: list[tuple[date, float]] = []
-        for _, row in edited.iterrows():
-            try:
-                d = datetime.strptime(str(row["Дата вступления"]), "%d.%m.%Y").date()
-                r = float(row["Ставка (%)"])
-                custom_rates.append((d, r))
-            except Exception:
-                pass
-        cbr_to_use = sorted(custom_rates, key=lambda x: x[0]) if custom_rates else CBR_RATES
-
-    if st.button("🧮 Рассчитать пени", type="primary", use_container_width=True):
-        if not schedule_data:
-            st.error("⚠️ Загрузите график платежей на вкладке «График платежей»")
-        else:
-            results = calculate_penalties(schedule_data, payments_data, cbr_to_use, calc_date)
-
-            if not results:
-                st.success("✅ Просрочек не обнаружено!")
-            else:
-                total_penalty  = sum(r["penalty"] for r in results)
-                total_planned  = sum(a for d, a in schedule_data if d <= calc_date)
-                total_paid_sum = sum(a for d, a in payments_data if d <= calc_date)
-                overdue_debt   = max(0.0, total_planned - total_paid_sum)
-
-                m1, m2, m3 = st.columns(3)
-                m1.metric("По графику (накоплено)", f"{total_planned:,.2f} ₽")
-                m2.metric("Фактически оплачено",     f"{total_paid_sum:,.2f} ₽")
-                m3.metric("Сумма пеней",              f"{total_penalty:,.2f} ₽",
-                          delta=f"Остаток долга: {overdue_debt:,.2f} ₽",
-                          delta_color="inverse")
-
-                # Таблица расчёта
-                df_res = pd.DataFrame([{
-                    "Период с":           r["date_from"].strftime("%d.%m.%Y"),
-                    "Период по":          r["date_to"].strftime("%d.%m.%Y"),
-                    "Дней":               r["days"],
-                    "Сумма долга, руб.":  f"{r['debt']:,.2f}",
-                    "Ставка ЦБ":          f"{r['rate']:.2f}%",
-                    "1/300 ставки":       f"{r['rate']/300:.4f}%",
-                    "Пени, руб.":         f"{r['penalty']:,.2f}",
-                } for r in results])
-                st.dataframe(df_res, use_container_width=True, hide_index=True)
-                st.markdown(f"**Итого пеней: {total_penalty:,.2f} ₽**")
-
-                # Скачать Excel
-                info = {
-                    "borrower":      borrower or "—",
-                    "contract_num":  contract_num or "—",
-                    "contract_date": contract_date.strftime("%d.%m.%Y"),
-                    "calc_date":     calc_date.strftime("%d.%m.%Y"),
-                }
-                st.download_button(
-                    "📥 Скачать расчёт для суда (Excel)",
-                    data=export_excel(results, info, total_penalty),
-                    file_name=f"пени_{contract_num or 'договор'}_{calc_date}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True,
-                )
